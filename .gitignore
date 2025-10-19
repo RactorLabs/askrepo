@@ -1,0 +1,9 @@
+# Build artifacts
+/target
+
+# Environment / runtime configuration
+.env
+
+# Misc tooling
+**/*.rs.bk
+.DS_Store
