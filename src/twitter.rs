@@ -26,7 +26,7 @@ impl Tweet {
 }
 
 #[derive(Debug, Deserialize)]
-struct MentionsResponse {
+struct TweetsResponse {
     #[serde(default)]
     data: Vec<Tweet>,
     #[serde(default)]
@@ -48,26 +48,36 @@ pub struct TwitterClient {
     base_url: Url,
     user_id: String,
     bearer_token: String,
+    username: String,
 }
 
 impl TwitterClient {
-    pub fn new(config: &Config) -> Result<Self> {
+    pub async fn new(config: &Config) -> Result<Self> {
         let http = Client::builder()
             .user_agent("askrepo-service/0.1")
             .build()
             .context("failed to build twitter reqwest client")?;
 
-        let mut base_url = Url::parse(&config.twitter_api_base)
-            .context("TWITTER_API_BASE is not a valid URL")?;
+        let mut base_url =
+            Url::parse(&config.twitter_api_base).context("TWITTER_API_BASE is not a valid URL")?;
         if base_url.path().is_empty() || base_url.path() == "/" {
             base_url.set_path("/");
         }
+
+        let username = Self::fetch_username(
+            &http,
+            &base_url,
+            &config.twitter_user_id,
+            &config.twitter_bearer_token,
+        )
+        .await?;
 
         Ok(Self {
             http,
             base_url,
             user_id: config.twitter_user_id.clone(),
             bearer_token: config.twitter_bearer_token.clone(),
+            username,
         })
     }
 
@@ -123,7 +133,7 @@ impl TwitterClient {
                 ));
             }
 
-            let payload: MentionsResponse = response
+            let payload: TweetsResponse = response
                 .json()
                 .await
                 .context("failed to parse Twitter mentions response JSON")?;
@@ -146,4 +156,105 @@ impl TwitterClient {
 
         Ok(collected)
     }
+
+    pub async fn has_replied_to_conversation(&self, conversation_id: &str) -> Result<bool> {
+        let mut url = self
+            .base_url
+            .join("2/tweets/search/recent")
+            .context("failed to build Twitter search URL")?;
+
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair(
+                "query",
+                &format!("conversation_id:{} from:{}", conversation_id, self.username),
+            );
+            query.append_pair("max_results", "10");
+            query.append_pair("tweet.fields", "author_id,conversation_id,created_at");
+        }
+
+        trace!(conversation_id, "checking for prior AskRepo reply");
+
+        let response = self
+            .http
+            .get(url.clone())
+            .bearer_auth(&self.bearer_token)
+            .send()
+            .await
+            .with_context(|| format!("failed to call Twitter search endpoint: {}", url))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let headers = response.headers().clone();
+            warn!(retry_after = ?headers.get("retry-after"), "twitter rate limit hit during reply lookup");
+            return Err(anyhow!("rate limited by Twitter API"));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unable to read body>".to_string());
+            return Err(anyhow!(
+                "Twitter API returned {} for search request (body: {})",
+                status,
+                body
+            ));
+        }
+
+        let payload: TweetsResponse = response
+            .json()
+            .await
+            .context("failed to parse Twitter search response JSON")?;
+
+        Ok(!payload.data.is_empty())
+    }
+
+    async fn fetch_username(
+        http: &Client,
+        base_url: &Url,
+        user_id: &str,
+        bearer_token: &str,
+    ) -> Result<String> {
+        let url = base_url
+            .join(&format!("2/users/{}", user_id))
+            .context("failed to build Twitter user URL")?;
+
+        let response = http
+            .get(url.clone())
+            .bearer_auth(bearer_token)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch Twitter user profile: {}", url))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unable to read body>".to_string());
+            return Err(anyhow!(
+                "Twitter API returned {} for user lookup (body: {})",
+                status,
+                body
+            ));
+        }
+
+        let profile: UserResponse = response
+            .json()
+            .await
+            .context("failed to parse Twitter user response JSON")?;
+
+        Ok(profile.data.username.to_string())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UserResponse {
+    data: TwitterUser,
+}
+
+#[derive(Debug, Deserialize)]
+struct TwitterUser {
+    username: String,
 }

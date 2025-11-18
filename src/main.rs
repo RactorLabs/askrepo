@@ -1,13 +1,13 @@
 mod config;
-mod ractor;
+mod tsbx;
 mod twitter;
 
 use anyhow::{bail, Result};
 use config::Config;
-use ractor::{NewSessionPayload, RactorClient};
 use tokio::signal;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
+use tsbx::{NewSandboxPayload, TsbxClient};
 use twitter::TwitterClient;
 
 use serde_json::json;
@@ -23,18 +23,12 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     info!("starting askrepo service");
 
-    let twitter_client = TwitterClient::new(&config)?;
-    let ractor_client = RactorClient::new(&config)?;
+    let twitter_client = TwitterClient::new(&config).await?;
+    let tsbx_client = TsbxClient::new(&config)?;
 
     let mut since_id = config.initial_since_id.clone();
 
-    match process_mentions_cycle(
-        &twitter_client,
-        &ractor_client,
-        since_id.as_deref(),
-        &config,
-    )
-    .await
+    match process_mentions_cycle(&twitter_client, &tsbx_client, since_id.as_deref(), &config).await
     {
         Ok(new_id) => {
             if let Some(id) = new_id {
@@ -56,7 +50,7 @@ async fn main() -> Result<()> {
                 break;
             }
             _ = ticker.tick() => {
-                match process_mentions_cycle(&twitter_client, &ractor_client, since_id.as_deref(), &config).await {
+                match process_mentions_cycle(&twitter_client, &tsbx_client, since_id.as_deref(), &config).await {
                     Ok(new_id) => {
                         if let Some(id) = new_id {
                             since_id = Some(id);
@@ -75,7 +69,7 @@ async fn main() -> Result<()> {
 
 async fn process_mentions_cycle(
     twitter: &TwitterClient,
-    ractor_client: &RactorClient,
+    tsbx_client: &TsbxClient,
     since_id: Option<&str>,
     config: &Config,
 ) -> Result<Option<String>> {
@@ -105,13 +99,13 @@ async fn process_mentions_cycle(
     let mut had_error = false;
 
     for (numeric_id, tweet) in tweets_with_ids {
-        match ensure_session_for_tweet(ractor_client, &tweet, config).await {
+        match ensure_sandbox_for_tweet(twitter, tsbx_client, &tweet, config).await {
             Ok(_) => {
                 let updated = Some(last_success_id.map_or(numeric_id, |curr| curr.max(numeric_id)));
                 last_success_id = updated;
             }
             Err(err) => {
-                error!(?err, tweet_id = %tweet.id, "failed to ensure session for tweet");
+                error!(?err, tweet_id = %tweet.id, "failed to ensure sandbox for tweet");
                 had_error = true;
             }
         }
@@ -124,16 +118,31 @@ async fn process_mentions_cycle(
     Ok(last_success_id.map(|id| id.to_string()))
 }
 
-async fn ensure_session_for_tweet(
-    ractor_client: &RactorClient,
+async fn ensure_sandbox_for_tweet(
+    twitter: &TwitterClient,
+    tsbx_client: &TsbxClient,
     tweet: &twitter::Tweet,
     config: &Config,
 ) -> Result<()> {
     let tweet_id = tweet.id.as_str();
-    let session_name = format!("tweet-{}", tweet_id);
-    if ractor_client.session_exists(&session_name).await? {
-        debug!(session = %session_name, "session already exists; skipping creation");
+    let tweet_tag = format!("tweet{}", tweet_id);
+    if tsbx_client.sandbox_exists_with_tag(&tweet_tag).await? {
+        debug!(
+            tweet_id = tweet_id,
+            "sandbox already exists; skipping creation"
+        );
         return Ok(());
+    }
+
+    if let Some(conversation_id) = tweet.conversation_id.as_deref() {
+        if twitter.has_replied_to_conversation(conversation_id).await? {
+            debug!(
+                tweet_id = tweet_id,
+                conversation_id = conversation_id,
+                "AskRepo already replied; skipping tweet"
+            );
+            return Ok(());
+        }
     }
 
     let metadata = json!({
@@ -147,31 +156,27 @@ async fn ensure_session_for_tweet(
         }
     });
 
-    let tags = vec![
-        "askrepo".to_string(),
-        "twitter".to_string(),
-        format!("tweet{}", tweet_id),
-    ];
+    let tags = vec!["askrepo".to_string(), "twitter".to_string(), tweet_tag];
 
     let prompt = build_initial_prompt(tweet);
     let instructions_overview = "You are AskRepo. Review repository questions sourced from Twitter mentions and follow the initial task details.".to_string();
 
-    let env_map = config.session_env();
+    let env_map = config.sandbox_env();
 
-    let payload = NewSessionPayload::new(session_name.clone(), metadata)
+    let sandbox_payload = NewSandboxPayload::new(metadata)
         .with_description(Some(format!(
-            "AskRepo session bootstrap for tweet {}",
+            "AskRepo sandbox bootstrap for tweet {}",
             tweet_id
         )))
         .with_tags(tags)
         .with_instructions(instructions_overview)
-        .with_prompt(prompt)
         .with_idle_timeout(Some(900))
-        .with_busy_timeout(Some(1800))
-        .with_env(env_map);
+        .with_env(env_map)
+        .with_startup_task(prompt);
 
-    ractor_client.create_session(&payload).await?;
-    info!(session = %session_name, "created new AskRepo session");
+    let sandbox = tsbx_client.create_sandbox(&sandbox_payload).await?;
+
+    info!(sandbox = %sandbox.id, tweet_id = tweet_id, "created new AskRepo sandbox");
     Ok(())
 }
 
@@ -185,7 +190,7 @@ Tweet details:
 
 Task:
 - Read the conversation referenced by {tweet_id}.
-- Clone the `twitter_api_client` repository and run `twitter_api_client/get-tweet.py` to pull the full thread content.
+- Clone the `ractorlabs/twitter_api_client` repository and run `twitter_api_client/get-tweet.py` to pull the full thread content.
 - Apply guardrails: only proceed if the user is asking about a software repository *and* the thread contains a repository URL or explicit owner/repo reference. Otherwise, explain why the request is skipped.
 - If the thread only references shortened links (for example, `t.co`), expand them and follow the redirects to determine whether they lead to a GitHub repository or owner/name combo before deciding the task lacks repo details.
 - Identify the repository in question from the thread, clone it locally, and inspect the codebase.

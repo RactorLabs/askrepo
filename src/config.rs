@@ -8,8 +8,8 @@ pub struct Config {
     pub twitter_user_id: String,
     pub twitter_api_base: String,
     pub poll_interval: Duration,
-    pub ractor_host_url: String,
-    pub ractor_admin_token: String,
+    pub tsbx_host_url: String,
+    pub tsbx_admin_token: String,
     pub initial_since_id: Option<String>,
     pub twitter_api_key: Option<String>,
     pub twitter_api_secret: Option<String>,
@@ -21,13 +21,13 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let twitter_bearer_token = required_env("TWITTER_BEARER_TOKEN")?;
         let twitter_user_id = required_env("TWITTER_USER_ID")?;
-        let twitter_api_base = optional_env("TWITTER_API_BASE")
-            .unwrap_or_else(|| "https://api.x.com".to_string());
+        let twitter_api_base =
+            optional_env("TWITTER_API_BASE").unwrap_or_else(|| "https://api.x.com".to_string());
         let poll_interval_secs: u64 = optional_env("TWITTER_POLL_INTERVAL_SECS")
             .and_then(|val| val.parse().ok())
             .unwrap_or(90);
-        let ractor_host_url = required_env("RACTOR_HOST_URL")?;
-        let ractor_admin_token = required_env("RACTOR_ADMIN_TOKEN")?;
+        let tsbx_host_url = required_env("TSBX_HOST_URL")?;
+        let tsbx_admin_token = required_env("TSBX_ADMIN_TOKEN")?;
         let initial_since_id = optional_env("TWITTER_SINCE_ID");
         let twitter_api_key = required_env("TWITTER_API_KEY")?;
         let twitter_api_secret = required_env("TWITTER_API_SECRET")?;
@@ -39,8 +39,8 @@ impl Config {
             twitter_user_id,
             twitter_api_base,
             poll_interval: Duration::from_secs(poll_interval_secs.max(10)),
-            ractor_host_url,
-            ractor_admin_token,
+            tsbx_host_url,
+            tsbx_admin_token,
             initial_since_id,
             twitter_api_key: Some(twitter_api_key.clone()),
             twitter_api_secret: Some(twitter_api_secret.clone()),
@@ -49,7 +49,7 @@ impl Config {
         })
     }
 
-    pub fn session_env(&self) -> HashMap<String, String> {
+    pub fn sandbox_env(&self) -> HashMap<String, String> {
         let mut env_map = HashMap::new();
         env_map.insert(
             "TWITTER_BEARER_TOKEN".to_string(),
@@ -57,7 +57,9 @@ impl Config {
         );
         env_map.insert(
             "TWITTER_API_KEY".to_string(),
-            self.twitter_api_key.clone().expect("api key checked at startup"),
+            self.twitter_api_key
+                .clone()
+                .expect("api key checked at startup"),
         );
         env_map.insert(
             "TWITTER_API_SECRET".to_string(),
